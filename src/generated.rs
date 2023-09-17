@@ -1546,7 +1546,7 @@ impl Default for UpdateMsgType {
         UpdateMsgType::Update
     }
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Default, Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateNameMsg {
     pub id: i64,

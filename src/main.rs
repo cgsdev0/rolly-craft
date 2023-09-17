@@ -14,6 +14,8 @@ use bevy_tokio_tasks::TokioTasksRuntime;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 use valence::prelude::*;
 
+use crate::generated::UpdateNameMsg;
+
 const SPAWN_POS: BlockPos = BlockPos::new(0, 100, -16);
 #[derive(Component)]
 pub struct GameServerConnection {
@@ -26,10 +28,12 @@ impl GameServerConnection {
         runtime: &mut bevy_tokio_tasks::TokioTasksRuntime,
         mq: &mut MessageQueue<QueueMessage>,
         entity_id: Entity,
+        username: String,
     ) -> Self {
         println!("creating new websocket connection!");
         let (send_tx, send_rx) = futures_channel::mpsc::unbounded::<String>();
         let sender = mq.sender.clone();
+        let other_sender = send_tx.clone();
         runtime.spawn_background_task(move |_ctx| async move {
             println!("This task is running on a background thread");
 
@@ -42,7 +46,10 @@ impl GameServerConnection {
             request
                 .headers_mut()
                 // TODO: dont hardcode session
-                .insert("Cookie", HeaderValue::from_str("_session=asdf").unwrap());
+                .insert(
+                    "Cookie",
+                    HeaderValue::from_str(&format!("_session=minecrafter:{}", username)).unwrap(),
+                );
 
             let (ws_stream, _) = connect_async(request).await.expect("Failed to connect");
             println!("WebSocket handshake has been successfully completed");
@@ -51,6 +58,15 @@ impl GameServerConnection {
             let stdin_to_ws = send_rx
                 .map(|m| Ok(tokio_tungstenite::tungstenite::protocol::Message::Text(m)))
                 .forward(write);
+            other_sender
+                .unbounded_send(
+                    serde_json::to_string(&generated::UpdateNameMsg {
+                        name: username,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
             let ws_to_stdout = {
                 read.for_each(|message| async {
                     let data = message.unwrap().into_text().unwrap();
@@ -101,7 +117,7 @@ fn chat_event_handler(
         client, message, ..
     } in messages.iter()
     {
-        let Ok((username, _, _, mut connection)) = clients.get_mut(*client) else {
+        let Ok((_, _, _, mut connection)) = clients.get_mut(*client) else {
             continue;
         };
 
@@ -198,6 +214,7 @@ fn init_clients(
             &mut VisibleEntityLayers,
             &mut Position,
             &mut GameMode,
+            &Username,
             Entity,
         ),
         Added<Client>,
@@ -210,6 +227,7 @@ fn init_clients(
         mut visible_entity_layers,
         mut pos,
         mut game_mode,
+        username,
         entity,
     ) in &mut clients
     {
@@ -224,8 +242,11 @@ fn init_clients(
             SPAWN_POS.z as f64 + 0.5,
         ]);
         *game_mode = GameMode::Survival;
-        commands
-            .entity(entity)
-            .insert(GameServerConnection::new(&mut runtime, &mut mq, entity));
+        commands.entity(entity).insert(GameServerConnection::new(
+            &mut runtime,
+            &mut mq,
+            entity,
+            username.to_string(),
+        ));
     }
 }
