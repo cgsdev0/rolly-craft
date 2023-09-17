@@ -1,7 +1,10 @@
 #![allow(clippy::type_complexity)]
+pub mod generated;
 
 use futures_util::{future, pin_mut, StreamExt};
 use tokio_tungstenite::connect_async;
+
+use valence::message::ChatMessageEvent;
 
 use std::str::FromStr;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -12,49 +15,63 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 use valence::prelude::*;
 
 const SPAWN_POS: BlockPos = BlockPos::new(0, 100, -16);
-
 #[derive(Component)]
 pub struct GameServerConnection {
-    pub close_tx: futures_channel::mpsc::UnboundedSender<i64>,
+    pub send_tx: futures_channel::mpsc::UnboundedSender<String>,
+    pub entity_id: Entity,
 }
 
 impl GameServerConnection {
-    fn new(runtime: &mut bevy_tokio_tasks::TokioTasksRuntime) -> Self {
+    fn new(
+        runtime: &mut bevy_tokio_tasks::TokioTasksRuntime,
+        mq: &mut MessageQueue<QueueMessage>,
+        entity_id: Entity,
+    ) -> Self {
         println!("creating new websocket connection!");
-        let (close_tx, mut close_rx) = futures_channel::mpsc::unbounded();
-        runtime.spawn_background_task(|_ctx| async move {
+        let (send_tx, send_rx) = futures_channel::mpsc::unbounded::<String>();
+        let sender = mq.sender.clone();
+        runtime.spawn_background_task(move |_ctx| async move {
             println!("This task is running on a background thread");
 
-            let uri = Uri::from_str("wss://rollycubes.com/ws/room/xEnPPK").unwrap();
+            let uri = Uri::from_str("wss://beta.rollycubes.com/ws/room/Vqmbr7").unwrap();
             let mut request = uri.into_client_request().unwrap();
+            request.headers_mut().insert(
+                "Origin",
+                HeaderValue::from_str("beta.rollycubes.com").unwrap(),
+            );
             request
                 .headers_mut()
-                .insert("Origin", HeaderValue::from_str("rollycubes.com").unwrap());
-            request
-                .headers_mut()
+                // TODO: dont hardcode session
                 .insert("Cookie", HeaderValue::from_str("_session=asdf").unwrap());
 
             let (ws_stream, _) = connect_async(request).await.expect("Failed to connect");
             println!("WebSocket handshake has been successfully completed");
 
-            let (_, read) = ws_stream.split();
-
+            let (write, read) = ws_stream.split();
+            let stdin_to_ws = send_rx
+                .map(|m| Ok(tokio_tungstenite::tungstenite::protocol::Message::Text(m)))
+                .forward(write);
             let ws_to_stdout = {
                 read.for_each(|message| async {
                     let data = message.unwrap().into_text().unwrap();
                     println!("{}", data);
+                    let msg: generated::ServerMsg = serde_json::from_str(data.as_str()).unwrap();
+                    println!("{msg:?}");
+                    sender.send(QueueMessage { msg, entity_id }).unwrap();
                 })
             };
-            let pin_me = close_rx.next();
-            pin_mut!(pin_me, ws_to_stdout);
-            future::select(pin_me, ws_to_stdout).await;
+            pin_mut!(stdin_to_ws, ws_to_stdout);
+            future::select(stdin_to_ws, ws_to_stdout).await;
             println!("rip websocket");
-            close_rx.close();
         });
-        Self { close_tx }
+        Self { send_tx, entity_id }
     }
     fn close(&mut self) {
         println!("closing websocket connection");
+    }
+    pub fn send<T: serde::Serialize>(&mut self, thing: T) {
+        let text = serde_json::to_string(&thing).unwrap();
+        self.send_tx.unbounded_send(text).unwrap();
     }
 }
 
@@ -68,20 +85,41 @@ fn main() {
             (
                 init_clients,
                 disconnect_clients,
+                handle_websocket_events,
+                chat_event_handler,
                 despawn_disconnected_clients,
             ),
         )
         .run();
 }
 
+fn chat_event_handler(
+    mut clients: Query<(&Username, &Properties, &UniqueId, &mut GameServerConnection)>,
+    mut messages: EventReader<ChatMessageEvent>,
+) {
+    for ChatMessageEvent {
+        client, message, ..
+    } in messages.iter()
+    {
+        let Ok((username, _, _, mut connection)) = clients.get_mut(*client) else {
+            continue;
+        };
+
+        connection.send(generated::ChatMsg {
+            msg: message.to_string(),
+            ..Default::default()
+        });
+    }
+}
 #[derive(Resource)]
 pub struct MessageQueue<T> {
     pub sender: std::sync::mpsc::Sender<T>,
     pub receiver: std::sync::Mutex<std::sync::mpsc::Receiver<T>>,
 }
 
-pub enum QueueMessage {
-    Hello,
+pub struct QueueMessage {
+    msg: generated::ServerMsg,
+    entity_id: Entity,
 }
 
 fn setup(
@@ -110,6 +148,35 @@ fn setup(
     commands.spawn(layer);
 }
 
+fn handle_websocket_events(
+    mut mq: ResMut<MessageQueue<QueueMessage>>,
+    mut query: Query<&mut Client>,
+) {
+    let receiver = mq.receiver.get_mut().unwrap();
+    while let Ok(msg) = receiver.try_recv() {
+        match msg.msg {
+            generated::ServerMsg::RoomListMsg(_) => {}
+            generated::ServerMsg::RefetchPlayerMsg(_) => {}
+            generated::ServerMsg::WelcomeMsg(_) => {}
+            generated::ServerMsg::RestartMsg(_) => {}
+            generated::ServerMsg::SpectatorsMsg(_) => {}
+            generated::ServerMsg::WinMsg(_) => {}
+            generated::ServerMsg::RollMsg(_) => {}
+            generated::ServerMsg::RollAgainMsg(_) => {}
+            generated::ServerMsg::JoinMsg(_) => {}
+            generated::ServerMsg::DisconnectMsg(_) => {}
+            generated::ServerMsg::ReconnectMsg(_) => {}
+            generated::ServerMsg::KickMsg(_) => {}
+            generated::ServerMsg::ChatMsg(m) => {
+                let mut client = query.get_mut(msg.entity_id).unwrap();
+                client.send_chat_message(m.msg);
+            }
+            generated::ServerMsg::UpdateTurnMsg(_) => {}
+            generated::ServerMsg::UpdateNameMsg(_) => {}
+            generated::ServerMsg::UpdateMsg(_) => {}
+        }
+    }
+}
 fn disconnect_clients(
     mut commands: Commands,
     mut clients: Query<(&mut GameServerConnection, Entity), Without<Client>>,
@@ -122,6 +189,7 @@ fn disconnect_clients(
 
 fn init_clients(
     mut runtime: ResMut<TokioTasksRuntime>,
+    mut mq: ResMut<MessageQueue<QueueMessage>>,
     mut commands: Commands,
     mut clients: Query<
         (
@@ -158,6 +226,6 @@ fn init_clients(
         *game_mode = GameMode::Survival;
         commands
             .entity(entity)
-            .insert(GameServerConnection::new(&mut runtime));
+            .insert(GameServerConnection::new(&mut runtime, &mut mq, entity));
     }
 }
