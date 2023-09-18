@@ -1,25 +1,21 @@
 #![allow(clippy::type_complexity)]
 pub mod generated;
 
-use futures_util::{future, pin_mut, StreamExt};
-use tokio_tungstenite::connect_async;
-
-use valence::message::ChatMessageEvent;
-
-use std::str::FromStr;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
 use bevy_tokio_tasks::TokioTasksRuntime;
-
+use futures_util::{future, pin_mut, SinkExt, StreamExt};
+use std::str::FromStr;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
+use valence::math::IVec3;
+use valence::message::ChatMessageEvent;
 use valence::prelude::*;
 
-use crate::generated::UpdateNameMsg;
-
-const SPAWN_POS: BlockPos = BlockPos::new(0, 100, -16);
+const SPAWN_POS: BlockPos = BlockPos::new(0, 100, 0);
 #[derive(Component)]
 pub struct GameServerConnection {
     pub send_tx: futures_channel::mpsc::UnboundedSender<String>,
+    pub close_tx: futures_channel::mpsc::UnboundedSender<i64>,
     pub entity_id: Entity,
 }
 
@@ -32,12 +28,13 @@ impl GameServerConnection {
     ) -> Self {
         println!("creating new websocket connection!");
         let (send_tx, send_rx) = futures_channel::mpsc::unbounded::<String>();
+        let (close_tx, mut close_rx) = futures_channel::mpsc::unbounded::<i64>();
         let sender = mq.sender.clone();
         let other_sender = send_tx.clone();
         runtime.spawn_background_task(move |_ctx| async move {
             println!("This task is running on a background thread");
 
-            let uri = Uri::from_str("wss://beta.rollycubes.com/ws/room/Vqmbr7").unwrap();
+            let uri = Uri::from_str("wss://beta.rollycubes.com/ws/room/9UkkHT").unwrap();
             let mut request = uri.into_client_request().unwrap();
             request.headers_mut().insert(
                 "Origin",
@@ -70,17 +67,21 @@ impl GameServerConnection {
             let ws_to_stdout = {
                 read.for_each(|message| async {
                     let data = message.unwrap().into_text().unwrap();
-                    println!("{}", data);
                     let msg: generated::ServerMsg = serde_json::from_str(data.as_str()).unwrap();
                     println!("{msg:?}");
                     sender.send(QueueMessage { msg, entity_id }).unwrap();
                 })
             };
-            pin_mut!(stdin_to_ws, ws_to_stdout);
-            future::select(stdin_to_ws, ws_to_stdout).await;
+            let n = close_rx.next();
+            pin_mut!(stdin_to_ws, ws_to_stdout, n);
+            future::select(n, future::select(stdin_to_ws, ws_to_stdout)).await;
             println!("rip websocket");
         });
-        Self { send_tx, entity_id }
+        Self {
+            send_tx,
+            entity_id,
+            close_tx,
+        }
     }
     fn close(&mut self) {
         println!("closing websocket connection");
@@ -159,7 +160,18 @@ fn setup(
         }
     }
 
-    layer.chunk.set_block(SPAWN_POS, BlockState::BEDROCK);
+    for z in -5..6 {
+        for x in -5..6 {
+            for y in -5..6 {
+                if i32::abs(x) < 5 && i32::abs(y) < 5 && i32::abs(z) < 5 {
+                    continue;
+                }
+                layer
+                    .chunk
+                    .set_block(SPAWN_POS + IVec3 { x, y, z }, BlockState::GLASS);
+            }
+        }
+    }
 
     commands.spawn(layer);
 }
@@ -171,7 +183,9 @@ fn handle_websocket_events(
     let receiver = mq.receiver.get_mut().unwrap();
     while let Ok(msg) = receiver.try_recv() {
         match msg.msg {
+            generated::ServerMsg::ErrorMsg(_) => {}
             generated::ServerMsg::RoomListMsg(_) => {}
+            generated::ServerMsg::RedirectMsg(_) => {}
             generated::ServerMsg::RefetchPlayerMsg(_) => {}
             generated::ServerMsg::WelcomeMsg(_) => {}
             generated::ServerMsg::RestartMsg(_) => {}
@@ -241,7 +255,7 @@ fn init_clients(
             SPAWN_POS.y as f64 + 1.0,
             SPAWN_POS.z as f64 + 0.5,
         ]);
-        *game_mode = GameMode::Survival;
+        *game_mode = GameMode::Adventure;
         commands.entity(entity).insert(GameServerConnection::new(
             &mut runtime,
             &mut mq,

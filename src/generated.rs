@@ -1278,7 +1278,9 @@ impl Default for RoomListMsgType {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ServerMsg {
+    ErrorMsg(GameError),
     RoomListMsg(RoomListMsg),
+    RedirectMsg(Redirect),
     RefetchPlayerMsg(RefetchPlayerMsg),
     WelcomeMsg(WelcomeMsg),
     RestartMsg(RestartMsg),
